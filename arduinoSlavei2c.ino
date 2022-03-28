@@ -28,6 +28,49 @@ char swRxBuffer[16];
 AsyncDelay readInterval;
 /* end of softwire i2c */
 
+//helper function to decode decimal to binary coded decimal
+//used to help write the time to the rtc
+uint8_t dec2bcd(uint8_t num){
+  return( (num/10 * 16) + (num%10));
+}
+
+//helper function to decode binary decoded decimal to decimal
+//used to help read the time to the rtc
+uint8_t bcd2dec(uint8_t num){
+  return ( (num/16 * 10) + (num%16) );
+}
+
+static uint8_t bcd2bin(uint8_t val) { return val - 6 * (val >> 4); }
+static uint8_t bin2bcd(uint8_t val) { return val + 6 * (val / 10); }
+
+static uint8_t dowToDS3231(uint8_t d) { return d == 0 ? 7 : d; }
+
+const uint8_t daysInMonth[] PROGMEM = {31, 28, 31, 30, 31, 30,
+                                       31, 31, 30, 31, 30};
+
+uint8_t dayWeek(uint16_t y, uint8_t m, uint8_t d){
+   if (y >= 2000U)
+    y -= 2000U;
+  uint16_t days = d;
+  for (uint8_t i = 1; i < m; ++i)
+    days += pgm_read_byte(daysInMonth + i - 1);
+  if (m > 2 && y % 4 == 0)
+    ++days;
+  uint16_t day = days + 365 * y + (y+3) / 4 - 1;
+  return (day + 6) % 7;
+}
+
+char daysOfTheWeek[7][12] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+
+// Print with leading zero, as expected for time
+void printTwoDigit(int n)
+{
+  if (n < 10) {
+    Serial.print('0');
+  }
+  Serial.print(n);
+}
+
 //function that reads the virtual i2c bus for the rtc and returns the current time
 time_t readTime()
 {
@@ -47,116 +90,74 @@ time_t readTime()
     return now();
   }
 
-  int tenYear = (registers[6] & 0xf0) >> 4;
-  int unitYear = registers[6] & 0x0f;
-  int year = (10 * tenYear) + unitYear;
-
-  int tenMonth = (registers[5] & 0x10) >> 4;
-  int unitMonth = registers[5] & 0x0f;
-  int month = (10 * tenMonth) + unitMonth;
-
-  int tenDateOfMonth = (registers[4] & 0x30) >> 4;
-  int unitDateOfMonth = registers[4] & 0x0f;
-  int dateOfMonth = (10 * tenDateOfMonth) + unitDateOfMonth;
-
-  // Reading the hour is messy. See the datasheet for register details!
-  bool twelveHour = registers[2] & 0x40;
-  bool pm = false;
-  int unitHour;
-  int tenHour;
-  if (twelveHour) {
-    pm = registers[2] & 0x20;
-    tenHour = (registers[2] & 0x10) >> 4;
-  } else {
-    tenHour = (registers[2] & 0x30) >> 4;
-  }
-  unitHour = registers[2] & 0x0f;
-  int hour = (10 * tenHour) + unitHour;
-  if (twelveHour) {
-    // 12h clock? Convert to 24h.
-    hour += 12;
-  }
-
-  int tenMinute = (registers[1] & 0xf0) >> 4;
-  int unitMinute = registers[1] & 0x0f;
-  int minute = (10 * tenMinute) + unitMinute;
-
-  int tenSecond = (registers[0] & 0xf0) >> 4;
-  int unitSecond = registers[0] & 0x0f;
-  int second = (10 * tenSecond) + unitSecond;
-
   tmElements_t  tmSet;
-  tmSet.Year = year;
-  tmSet.Month = month;
-  tmSet.Day = dateOfMonth;
-  tmSet.Hour = hour;
-  tmSet.Minute = minute;
-  tmSet.Second = second;
+  tmSet.Second = bcd2dec(registers[0] & 0x7f);
+  tmSet.Minute = bcd2dec(registers[1]);
+  tmSet.Hour = bcd2dec(registers[2]);
+  tmSet.Day = bcd2dec(registers[4]);
+  tmSet.Month = bcd2dec(registers[5] & 0x7F);
+  tmSet.Year = (bcd2dec(registers[6]));
+
+  tmSet.Wday = dayWeek(tmSet.Year, tmSet.Month, tmSet.Day);
 
   Serial.print("read ");
-  for (int i = 0; i < 7; i++) {
+  for (int i = 7; i >= 0; i--) {
     Serial.print(registers[i], HEX);
   }
   Serial.println();
-  
+
+  // ISO8601 is the only sensible time format
+  /*
+  Serial.print("Time: ");
+  Serial.print(tmSet.Year);
+  Serial.print('-');
+  printTwoDigit(tmSet.Month);
+  Serial.print('-');
+  printTwoDigit(tmSet.Day);
+  Serial.print(" (");
+  Serial.print(daysOfTheWeek[tmSet.Wday]);
+  Serial.print(") ");
+  Serial.print('T');
+  printTwoDigit(tmSet.Hour);
+  Serial.print(':');
+  printTwoDigit(tmSet.Minute);
+  Serial.print(':');
+  printTwoDigit(tmSet.Second);
+  Serial.println();
+  */
+
   return makeTime(tmSet);
 }
 void writeTime(time_t t){
-  // Ensure register address is valid
-  sw.beginTransmission(I2C_ADDRESS);
-  sw.write(uint8_t(0)); // Access the first register
-  sw.endTransmission();
+  uint8_t registers[7];
 
-  uint8_t registers[7]; // There are 7 registers we need to read from to get the date and time.
-
-  int y = year(t)-1970;
-  uint8_t unitY = y%10;
-  uint8_t tenY = y/10;
-  registers[6] = (tenY << 4 ) & 0xf0;
-  registers[6] +=  (unitY & 0x0f);
-
-  int mo = month(t);
-  uint8_t unitMo = mo%10;
-  uint8_t tenMo = mo/10;
-  registers[5] = (tenMo << 4 ) & 0x10;
-  registers[5] +=  (unitMo & 0x0f);
-
-  int dateofMonth = day(t);
-  uint8_t unitDoM = dateofMonth%10;
-  uint8_t tenDoM = dateofMonth/10;
-  registers[4] = (tenDoM << 4 ) & 0x30;
-  registers[4] +=  (unitDoM & 0x0f);
-
-  int h = hour(t);
-  uint8_t unitH = h%10;
-  uint8_t tenH = h/10;
-  registers[2] = (tenH << 4 ) & 0x10;
-  registers[2] +=  (unitH & 0x0f);
-
-  int m = minute(t);
-  uint8_t unitM = m%10;
-  uint8_t tenM = m/10;
-  registers[1] = (tenM << 4 ) & 0xf0;
-  registers[1] +=  (unitM & 0x0f);
-
-  int s = second(t);
-  uint8_t unitS = s%10;
-  uint8_t tenS = s/10;
-  registers[0] = (tenS << 4 ) & 0xf0;
-  registers[0] +=  (unitS & 0x0f);
-
-  registers[3] = 1;
-  
+  registers[0] = bin2bcd(second(t));
+  registers[1] = bin2bcd(minute(t));
+  registers[2] = bin2bcd(hour(t));
+  registers[3] = bin2bcd(dowToDS3231(weekday(t)));
+  registers[4] = bin2bcd(day(t));
+  registers[5] = bin2bcd(month(t));
+  registers[6] = bin2bcd((year(t)-1970));
 
   sw.beginTransmission(I2C_ADDRESS); 
-  sw.write(uint8_t(0));
+  sw.write((uint8_t)0x00);  //ds3231 time register
   Serial.print("writ ");
-  for (int i = 7; i >=0; i--) {
+  for (int i = 0; i < 7; i++) {
     Serial.print(registers[i], HEX);
     registers[i] = sw.write(registers[i]);
   }
   sw.endTransmission();
   Serial.println();
+
+  //flip the Oscillatior Stop Flag bit
+  sw.beginTransmission(I2C_ADDRESS); 
+  sw.write((uint8_t)0x0F);  //ds3231 status register
+  sw.endTransmission();
+  uint8_t statreg = sw.read();
+  statreg &= ~0x80;
+  sw.beginTransmission(I2C_ADDRESS); 
+  sw.write(statreg);  //ds3231 status register
+  sw.endTransmission();
 }
 
 void setup() {
@@ -233,8 +234,8 @@ void receiveEvent(int howMany) {
     milli = (x[6]) | milli;
 
     Serial.println("Setting time to " + String(sec) + "(s) and " + String(milli) + "ms");
-    setTime(sec);
-    writeTime(sec);
+    time_t t = sec;
+    writeTime(t);
   }
 }
 
@@ -243,7 +244,7 @@ void sendData(){
   if(unixTime){
     //Serial.println("sending time");
     //send the current time to the obc
-    time_t t = now();
+    time_t t = readTime();
     byte y[6];
   
     unsigned long sec = t;
@@ -260,6 +261,9 @@ void sendData(){
       //Serial.println("Wrote: " + String(y[i]));
     }
     unixTime = false;
+    for(int i=0; i<6; i++){
+      Serial.println("Wrote: " + String(y[i]));
+    }
   }
   else{
     Serial.println("About to write data");
@@ -269,7 +273,26 @@ void sendData(){
 
 void loop() {
   if(readInterval.isExpired()){
-    Serial.println(now());
+    time_t t = readTime();
+    Serial.print("Time: ");
+    Serial.print(year(t));
+    Serial.print('-');
+    printTwoDigit(month(t));
+    Serial.print('-');
+    printTwoDigit(day(t));
+    Serial.print(" (");
+    Serial.print(daysOfTheWeek[weekday(t)]);
+    Serial.print(") ");
+    Serial.print('T');
+    printTwoDigit(hour(t));
+    Serial.print(':');
+    printTwoDigit(minute(t));
+    Serial.print(':');
+    printTwoDigit(second(t));
+    Serial.println();
+    Serial.print("TIME: ");
+    Serial.print(t);
+    Serial.println();
     readInterval.restart();
   }
 }
